@@ -40,11 +40,24 @@
 //|  - Boxes are built only from bars already on the chart; the box  |
 //|    of a running session grows with each bar.                     |
 //|  - Sessions are drawn on H1 and lower timeframes only.           |
+//|                                                                  |
+//|  Alerts                                                          |
+//|  - Pivot: fires on the bar where a pivot is confirmed (first     |
+//|    tick of the next bar), with its HH/HL/LH/LL label.            |
+//|  - Session break: the high/low of the LATEST COMPLETED instance  |
+//|    of each session. Close mode fires when a bar closes beyond    |
+//|    the level; Touch mode fires intrabar the moment price trades  |
+//|    beyond it. Each level alerts once.                            |
+//|  - Never fires for history: not on attach, timeframe change,     |
+//|    reload, or bars filled in after a reconnect. Only the newest  |
+//|    closed bar (and, in Touch mode, the forming bar) can alert.   |
+//|  - Push needs a MetaQuotes ID (Tools > Options > Notifications); |
+//|    email needs SMTP settings (Tools > Options > Email).          |
 //+------------------------------------------------------------------+
 #property copyright   ""
-#property version     "1.00"
+#property version     "1.10"
 #property description "ZigZag with confirmed pivots and a live leg, session boxes,"
-#property description "previous session high/low lines and HH/HL/LH/LL labels."
+#property description "previous session high/low lines, HH/HL/LH/LL labels and alerts."
 #property indicator_chart_window
 #property indicator_buffers 3
 #property indicator_plots   3
@@ -86,6 +99,12 @@ enum ENUM_DST_RULE
    DST_NONE = 0, // None
    DST_EU   = 1, // Europe (last Sun Mar - last Sun Oct)
    DST_US   = 2  // US (2nd Sun Mar - 1st Sun Nov)
+  };
+
+enum ENUM_BREAK_MODE
+  {
+   BREAK_CLOSE = 0, // Bar closes beyond level
+   BREAK_TOUCH = 1  // Price trades beyond level (intrabar)
   };
 
 //--- inputs
@@ -140,6 +159,16 @@ input bool   InpPrevLines    = true;   // Previous session high/low lines
 input bool   InpLatestOnly   = true;   // Lines: latest session only
 input int    InpObjDays      = 20;     // Draw objects for last N days
 input string InpPrefix       = "ZZS_"; // Object name prefix
+
+input group "Alerts"
+input bool            InpAlertPivot = true;        // Pivot confirmed
+input bool            InpAlertBreak = true;        // Previous session high/low broken
+input ENUM_BREAK_MODE InpBreakMode  = BREAK_CLOSE; // Break rule
+input bool            InpAlertPopup = true;        // Popup (with sound)
+input bool            InpAlertSound = false;       // Sound only (when popup is off)
+input string          InpSoundFile  = "alert.wav"; // Sound file (terminal Sounds folder)
+input bool            InpAlertPush  = false;       // Push notification
+input bool            InpAlertEmail = false;       // Email
 
 //--- buffers
 double ZZ[];      // confirmed pivots
@@ -199,6 +228,19 @@ SessDef  g_def[3];
 SessRun  g_run[3];
 bool     g_hasLines[3];
 datetime g_lineKey[3];
+
+//--- latest completed session levels, for break alerts
+bool     g_hasLvl[3];
+double   g_lvlHi[3];
+double   g_lvlLo[3];
+bool     g_brkHi[3];
+bool     g_brkLo[3];
+
+//--- alerts are armed only after the first full calculation
+bool     g_armed     = false;
+int      g_alertFrom = INT_MAX; // closed bars with index >= this may alert
+bool     g_pushWarned = false;
+bool     g_mailWarned = false;
 
 //--- misc state
 int      g_atr        = INVALID_HANDLE;
@@ -440,6 +482,44 @@ void HLine(const string n, const datetime t1, const datetime t2, const double p,
   }
 
 //+------------------------------------------------------------------+
+//| Alerts                                                           |
+//+------------------------------------------------------------------+
+string TfName()
+  {
+   string s = EnumToString((ENUM_TIMEFRAMES)_Period); // "PERIOD_M15"
+   return StringSubstr(s, 7);
+  }
+
+string Px(const double p)
+  {
+   return DoubleToString(p, _Digits);
+  }
+
+void Notify(const string what)
+  {
+   string msg = _Symbol + " " + TfName() + ": " + what;
+   if(InpAlertPopup)
+      Alert(msg); // also plays the terminal alert sound and writes to the log
+   else
+     {
+      Print(msg);
+      if(InpAlertSound)
+         PlaySound(InpSoundFile);
+     }
+   if(InpAlertPush && !SendNotification(msg) && !g_pushWarned)
+     {
+      g_pushWarned = true;
+      PrintFormat("Push notification failed (error %d). Set a MetaQuotes ID in Tools > Options > Notifications.",
+                  GetLastError());
+     }
+   if(InpAlertEmail && !SendMail("ZigZag Sessions " + _Symbol, msg) && !g_mailWarned)
+     {
+      g_mailWarned = true;
+      PrintFormat("Email failed (error %d). Check Tools > Options > Email.", GetLastError());
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| ZigZag                                                           |
 //+------------------------------------------------------------------+
 double Thr(const double atrv, const double ref)
@@ -486,6 +566,11 @@ void Confirm(const int type, const int bar, const double price, const int confBa
    if(InpLabels && time[bar] >= g_objFrom)
       Text(InpPrefix + "P" + IntegerToString((long)time[bar]) + (type > 0 ? "H" : "L"),
            time[bar], price, txt, c, InpLabelSize, type > 0 ? ANCHOR_LOWER : ANCHOR_UPPER);
+
+   if(InpAlertPivot && g_armed && confBar >= g_alertFrom)
+      Notify(StringFormat("swing %s confirmed %s %s (pivot bar %s)",
+                          type > 0 ? "high" : "low", txt, Px(price),
+                          TimeToString(time[bar], TIME_DATE | TIME_MINUTES)));
   }
 
 // New leg after a pivot at pivBar, rebuilt from bars (pivBar, i]
@@ -634,11 +719,44 @@ void SessFinalize(const int s)
       g_hasLines[s] = true;
       g_lineKey[s]  = g_run[s].start;
      }
+   g_hasLvl[s]     = true;
+   g_lvlHi[s]      = g_run[s].hi;
+   g_lvlLo[s]      = g_run[s].lo;
+   g_brkHi[s]      = false;
+   g_brkLo[s]      = false;
    g_run[s].active = false;
   }
 
+// Break of the latest completed session high/low. A level is marked broken even
+// when alerts are not armed, so history never alerts later.
+void CheckBreak(const int s, const double barHigh, const double barLow, const double barClose,
+                const bool closedBar, const bool canAlert)
+  {
+   if(!g_hasLvl[s])
+      return;
+   bool touch = (InpBreakMode == BREAK_TOUCH);
+   if(!touch && !closedBar)
+      return;
+   double up = touch ? barHigh : barClose;
+   double dn = touch ? barLow  : barClose;
+   string how = touch ? "price" : "close";
+   if(!g_brkHi[s] && up > g_lvlHi[s])
+     {
+      g_brkHi[s] = true;
+      if(canAlert && InpAlertBreak)
+         Notify(StringFormat("%s high %s broken, %s %s", g_def[s].name, Px(g_lvlHi[s]), how, Px(up)));
+     }
+   if(!g_brkLo[s] && dn < g_lvlLo[s])
+     {
+      g_brkLo[s] = true;
+      if(canAlert && InpAlertBreak)
+         Notify(StringFormat("%s low %s broken, %s %s", g_def[s].name, Px(g_lvlLo[s]), how, Px(dn)));
+     }
+  }
+
 // Process one CLOSED bar
-void SessBar(const int i, const datetime &time[], const double &high[], const double &low[])
+void SessBar(const int i, const datetime &time[], const double &high[], const double &low[],
+             const double &close[])
   {
    datetime u = ToUtc(time[i]);
    for(int s = 0; s < 3; s++)
@@ -669,6 +787,10 @@ void SessBar(const int i, const datetime &time[], const double &high[], const do
          if(low[i] < g_run[s].lo)  g_run[s].lo = low[i];
         }
      }
+   bool canAlert = g_armed && i >= g_alertFrom;
+   for(int s = 0; s < 3; s++)
+      if(g_def[s].on)
+         CheckBreak(s, high[i], low[i], close[i], true, canAlert);
   }
 
 // Draw running sessions including the forming bar; only time-based state is committed
@@ -705,6 +827,8 @@ void SessRender(const int f, const datetime &time[], const double &high[], const
          ObjectSetInteger(0, LineName(s, g_lineKey[s], "H"), OBJPROP_TIME, 1, xNow);
          ObjectSetInteger(0, LineName(s, g_lineKey[s], "L"), OBJPROP_TIME, 1, xNow);
         }
+      // Touch mode only: a price that has traded cannot un-trade, so this is final
+      CheckBreak(s, high[f], low[f], 0.0, false, g_armed);
      }
   }
 
@@ -723,6 +847,9 @@ void ResetAll(const int rates_total, const datetime &time[])
       g_run[s].active = false;
       g_hasLines[s]   = false;
       g_lineKey[s]    = 0;
+      g_hasLvl[s]     = false;
+      g_brkHi[s]      = false;
+      g_brkLo[s]      = false;
      }
    g_live[0]  = -1;
    g_live[1]  = -1;
@@ -786,9 +913,10 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
 
    bool anyOn = InpAsiaOn || InpLonOn || InpNyOn;
-   g_sessOK   = anyOn && (InpBoxes || InpPrevLines) && PeriodSeconds() <= PeriodSeconds(PERIOD_H1);
-   if(anyOn && (InpBoxes || InpPrevLines) && !g_sessOK)
-      Print("ZigZag Sessions: sessions are drawn on H1 and lower timeframes only");
+   bool wantS = InpBoxes || InpPrevLines || InpAlertBreak;
+   g_sessOK   = anyOn && wantS && PeriodSeconds() <= PeriodSeconds(PERIOD_H1);
+   if(anyOn && wantS && !g_sessOK)
+      Print("ZigZag Sessions: sessions and session alerts work on H1 and lower timeframes only");
 
    if(InpThrMode == THR_ATR)
      {
@@ -830,6 +958,7 @@ int OnCalculate(const int rates_total,
    ArraySetAsSeries(time, false);
    ArraySetAsSeries(high, false);
    ArraySetAsSeries(low, false);
+   ArraySetAsSeries(close, false);
 
    bool reset = (prev_calculated == 0);
    if(!reset && g_next > 0 && (g_next - 1 >= rates_total || time[g_next - 1] != g_lastTime))
@@ -845,6 +974,10 @@ int OnCalculate(const int rates_total,
         }
 
    int last = rates_total - 2; // last closed bar
+   // Alerts only after a full calculation, and only for the newest closed bar
+   // (bars filled in after a reconnect are history, not news).
+   g_armed     = !reset;
+   g_alertFrom = g_armed ? last : INT_MAX;
    double atr[];
    if(InpThrMode == THR_ATR && last >= g_next)
      {
@@ -861,7 +994,7 @@ int OnCalculate(const int rates_total,
       double a = (InpThrMode == THR_ATR) ? atr[i - g_next] : 0.0;
       ZZBar(i, time, high, low, a);
       if(g_sessOK && time[i] >= g_objFrom)
-         SessBar(i, time, high, low);
+         SessBar(i, time, high, low, close);
      }
    if(last >= g_next)
       g_next = last + 1;
